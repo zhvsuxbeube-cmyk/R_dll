@@ -16,8 +16,9 @@
  * Rust port of IniFile.h / IniFile.cpp
  */
 
+use alloc::string::String;
 use alloc::vec;
-use alloc::string::ToString;
+use alloc::vec::Vec;
 
 /// Maximum length for string fields — matches MAX_STRING_LEN in the C++ code.
 pub const MAX_STRING_LEN: usize = 255;
@@ -170,7 +171,7 @@ impl IniFile {
             if line.starts_with('[') && line.ends_with(']') {
                 let sect_name = &line[1..line.len()-1];
                 sections.push(IniSection {
-                    name: sect_name.to_string(),
+                    name: String::from(sect_name),
                     variables: Vec::new(),
                 });
                 current_section = Some(sections.len() - 1);
@@ -192,7 +193,7 @@ impl IniFile {
 
     /// Mirrors StrTrim — trims leading and trailing spaces / tabs.
     fn str_trim(s: &str) -> String {
-        s.trim_matches(|c| c == ' ' || c == '\t').to_string()
+        String::from(s.trim_matches(|c| c == ' ' || c == '\t'))
     }
 
     /// Mirrors IsVariable — returns true if the line contains an unquoted '='.

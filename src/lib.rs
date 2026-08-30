@@ -33,7 +33,7 @@ extern crate alloc;
 // The winapi crate pulls in its own core/alloc, so we do not need std.
 use alloc::vec;
 use alloc::vec::Vec;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::format;
 
 use core::ptr;
@@ -256,7 +256,7 @@ fn get_current_module() -> HMODULE {
     unsafe {
         let ok = GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-            get_current_module as *const () as LPCWSTR,
+            get_current_module as usize as LPCWSTR,
             &mut hmod,
         );
         if ok == 0 {
@@ -279,11 +279,20 @@ fn get_module_code_section_info(hmodule: HMODULE) -> Option<(PlatformDword, Plat
     let base = hmodule as usize;
     unsafe {
         let dos = base as *const u8;
-        // e_lfanew is at offset 0x3C
+        // Validate the DOS header before reading e_lfanew.
+        if *(dos as *const u16) != 0x5A4D {
+            return None;
+        }
+        // e_lfanew is at offset 0x3C.
         let e_lfanew = *(dos.add(0x3C) as *const u32) as usize;
-        // Skip "PE\0\0" (4 bytes) + IMAGE_FILE_HEADER (20 bytes) = 24 bytes to OPTIONAL_HEADER
-        let opt_header = dos.add(e_lfanew + 4 + 20);
-        // SizeOfCode is at offset 4 in IMAGE_OPTIONAL_HEADER
+        // Validate the PE signature before reading the file/optional headers.
+        let pe = dos.add(e_lfanew);
+        if *(pe as *const u32) != 0x0000_4550 {
+            return None;
+        }
+        // Skip "PE\0\0" (4 bytes) + IMAGE_FILE_HEADER (20 bytes) = 24 bytes to OPTIONAL_HEADER.
+        let opt_header = pe.add(4 + 20);
+        // SizeOfCode is at offset 4 in IMAGE_OPTIONAL_HEADER.
         let size_of_code = *(opt_header.add(4) as *const u32) as PlatformDword;
         if size_of_code == 0 {
             return None;
@@ -421,7 +430,7 @@ fn ini_read_string(section: &str, name: &str, default: &str) -> String {
             return var.value;
         }
     }
-    default.to_string()
+    String::from(default)
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +461,10 @@ unsafe extern "system" fn new_sl_get_windows_information_dword(
     pwsz_value_name: PCWSTR,
     pd_value: *mut DWORD,
 ) -> i32 {
+    if pwsz_value_name.is_null() || pd_value.is_null() {
+        return winapi::shared::winerror::E_INVALIDARG;
+    }
+
     // Build a wide slice for the value name so we can convert it
     let mut len = 0usize;
     while *pwsz_value_name.add(len) != 0 { len += 1; }
@@ -474,7 +487,10 @@ unsafe extern "system" fn new_sl_get_windows_information_dword(
 
     // Temporarily restore the original bytes, call through, then re-hook.
     let g = globals();
-    let sl_fn_ptr = g.sl_get_info.expect("SLGetWindowsInformationDWORD not loaded");
+    let sl_fn_ptr = match g.sl_get_info {
+        Some(f) => f,
+        None => return winapi::shared::winerror::E_FAIL,
+    };
     let target_addr = sl_fn_ptr as *mut u8;
 
     // Restore original bytes
@@ -534,6 +550,10 @@ unsafe extern "fastcall" fn new_win8_sl(pwsz_value_name: PCWSTR, pd_value: *mut 
 }
 
 unsafe fn new_win8_sl_impl(pwsz_value_name: PCWSTR, pd_value: *mut DWORD) -> i32 {
+    if pwsz_value_name.is_null() || pd_value.is_null() {
+        return winapi::shared::winerror::E_INVALIDARG;
+    }
+
     let mut len = 0usize;
     while *pwsz_value_name.add(len) != 0 { len += 1; }
     let name_slice = core::slice::from_raw_parts(pwsz_value_name, len);
@@ -656,16 +676,22 @@ unsafe extern "system" fn new_csl_query_initialize() -> i32 {
 // ---------------------------------------------------------------------------
 // Helper: write a FARJMP trampoline into an address inside the target process
 // ---------------------------------------------------------------------------
-unsafe fn write_jump(target: *mut u8, jump: &FarJmp) {
+unsafe fn write_jump(target: *mut u8, jump: &FarJmp) -> bool {
     let mut bw: usize = 0;
-    WriteProcessMemory(
+    let ok = WriteProcessMemory(
         GetCurrentProcess(),
         target as LPVOID,
         jump.as_bytes().as_ptr() as *const _,
         jump.size(),
         &mut bw,
     );
+    ok != 0 && bw == jump.size()
 }
+
+fn patch_address(base: PlatformDword, offset: PlatformDword) -> Option<PlatformDword> {
+    base.checked_add(offset)
+}
+
 
 // ---------------------------------------------------------------------------
 // hook() — the big initialisation function; mirrors Hook() in C++
@@ -925,8 +951,8 @@ unsafe fn apply_binary_patch(sect: &str, arch: &str, ts_base: PlatformDword) {
             if !patch_name.is_empty() {
                 if let Some(ref ini) = globals().ini_file {
                     if let Some(ba) = ini.get_bytearray("PatchCodes", &patch_name) {
-                        if let Some(sign_ptr) = ts_base.checked_add(offset) {
-                            if sign_ptr > ts_base && !ba.value.is_empty() {
+                        if !ba.value.is_empty() {
+                            if let Some(sign_ptr) = patch_address(ts_base, offset) {
                                 let mut bw: usize = 0;
                                 WriteProcessMemory(
                                     GetCurrentProcess(),
@@ -960,8 +986,8 @@ unsafe fn apply_binary_patch(sect: &str, arch: &str, ts_base: PlatformDword) {
             if !patch_name.is_empty() {
                 if let Some(ref ini) = globals().ini_file {
                     if let Some(ba) = ini.get_bytearray("PatchCodes", &patch_name) {
-                        if let Some(sign_ptr) = ts_base.checked_add(offset) {
-                            if sign_ptr > ts_base && !ba.value.is_empty() {
+                        if !ba.value.is_empty() {
+                            if let Some(sign_ptr) = patch_address(ts_base, offset) {
                                 let mut bw: usize = 0;
                                 WriteProcessMemory(
                                     GetCurrentProcess(),
@@ -995,8 +1021,8 @@ unsafe fn apply_binary_patch(sect: &str, arch: &str, ts_base: PlatformDword) {
             if !patch_name.is_empty() {
                 if let Some(ref ini) = globals().ini_file {
                     if let Some(ba) = ini.get_bytearray("PatchCodes", &patch_name) {
-                        if let Some(sign_ptr) = ts_base.checked_add(offset) {
-                            if sign_ptr > ts_base && !ba.value.is_empty() {
+                        if !ba.value.is_empty() {
+                            if let Some(sign_ptr) = patch_address(ts_base, offset) {
                                 let mut bw: usize = 0;
                                 WriteProcessMemory(
                                     GetCurrentProcess(),
@@ -1045,10 +1071,8 @@ unsafe fn apply_binary_patch(sect: &str, arch: &str, ts_base: PlatformDword) {
             let _ = func_name; // suppress unused-variable on x64
 
             let jump = make_stub(target_fn);
-            if let Some(sign_ptr) = ts_base.checked_add(offset) {
-                if sign_ptr > ts_base {
-                    write_jump(sign_ptr as *mut u8, &jump);
-                }
+            if let Some(sign_ptr) = patch_address(ts_base, offset) {
+                let _ = write_jump(sign_ptr as *mut u8, &jump);
             }
         }
     }
@@ -1069,10 +1093,8 @@ unsafe fn apply_binary_patch(sect: &str, arch: &str, ts_base: PlatformDword) {
             let _func_name = ini_read_string(sect, &func_key, "New_CSLQuery_Initialize");
             // Only one function is ever used here
             let jump = make_stub(new_csl_query_initialize as PlatformDword);
-            if let Some(sign_ptr) = ts_base.checked_add(offset) {
-                if sign_ptr > ts_base {
-                    write_jump(sign_ptr as *mut u8, &jump);
-                }
+            if let Some(sign_ptr) = patch_address(ts_base, offset) {
+                let _ = write_jump(sign_ptr as *mut u8, &jump);
             }
         }
     }
@@ -1087,11 +1109,16 @@ unsafe fn apply_binary_patch(sect: &str, arch: &str, ts_base: PlatformDword) {
 /// Mirrors: void WINAPI ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv)
 #[no_mangle]
 pub unsafe extern "system" fn ServiceMain(dw_argc: DWORD, lpsz_argv: *mut *mut u16) {
-    write_to_log(">>> ServiceMain\r\n");
-
     if !ALREADY_HOOKED.load(Ordering::SeqCst) {
         hook();
     }
+
+    // hook() must run before any logging because it creates the global state.
+    if GLOBALS_PTR.is_null() {
+        return;
+    }
+
+    write_to_log(">>> ServiceMain\r\n");
 
     if let Some(f) = globals().service_main {
         f(dw_argc, lpsz_argv);
@@ -1103,11 +1130,16 @@ pub unsafe extern "system" fn ServiceMain(dw_argc: DWORD, lpsz_argv: *mut *mut u
 /// Mirrors: void WINAPI SvchostPushServiceGlobals(void *lpGlobalData)
 #[no_mangle]
 pub unsafe extern "system" fn SvchostPushServiceGlobals(lp_global_data: PVOID) {
-    write_to_log(">>> SvchostPushServiceGlobals\r\n");
-
     if !ALREADY_HOOKED.load(Ordering::SeqCst) {
         hook();
     }
+
+    // hook() must run before any logging because it creates the global state.
+    if GLOBALS_PTR.is_null() {
+        return;
+    }
+
+    write_to_log(">>> SvchostPushServiceGlobals\r\n");
 
     if let Some(f) = globals().svchost_push {
         f(lp_global_data);
