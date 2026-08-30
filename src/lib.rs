@@ -31,6 +31,7 @@
 extern crate alloc;
 
 // The winapi crate pulls in its own core/alloc, so we do not need std.
+use alloc::vec;
 use alloc::vec::Vec;
 use alloc::string::String;
 use alloc::format;
@@ -45,6 +46,7 @@ use winapi::um::libloaderapi::{
     FindResourceW, LoadResource,
 };
 use winapi::um::fileapi::{CreateFileW, SetFilePointer, WriteFile, OPEN_ALWAYS};
+use winapi::um::winbase::FILE_END;
 use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
 use winapi::um::memoryapi::{ReadProcessMemory, WriteProcessMemory};
 use winapi::um::processthreadsapi::{GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, OpenThread};
@@ -52,7 +54,7 @@ use winapi::um::tlhelp32::{
     CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
 use winapi::um::winnt::{
-    FILE_ATTRIBUTE_NORMAL, FILE_END, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
     GENERIC_WRITE, HANDLE, THREAD_SUSPEND_RESUME,
 };
 use winapi::um::processthreadsapi::{ResumeThread, SuspendThread};
