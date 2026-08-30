@@ -1,0 +1,35 @@
+[package]
+name = "rdpwrap"
+version = "1.0.0"
+edition = "2021"
+description = "RDP Wrapper Library - Rust port of rdpwrap.dll"
+license = "Apache-2.0"
+
+[lib]
+name = "rdpwrap"
+crate-type = ["cdylib"]
+
+[dependencies]
+# no external crates — everything is done via raw Windows API through winapi
+winapi = { version = "0.3", features = [
+    "winerror",
+    "winnt",
+    "winbase",
+    "fileapi",
+    "handleapi",
+    "libloaderapi",
+    "memoryapi",
+    "processthreadsapi",
+    "tlhelp32",
+    "minwindef",
+    "basetsd",
+    "errhandlingapi",
+    "heapapi",
+] }
+
+[profile.release]
+opt-level = "s"        # optimise for size — mirrors the original small DLL
+lto = true
+codegen-units = 1
+panic = "abort"        # no unwinding machinery needed in a DLL
+strip = "symbols"
