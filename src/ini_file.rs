@@ -16,6 +16,8 @@
  * Rust port of IniFile.h / IniFile.cpp
  */
 
+use alloc::vec;
+
 /// Maximum length for string fields — matches MAX_STRING_LEN in the C++ code.
 pub const MAX_STRING_LEN: usize = 255;
 
@@ -87,10 +89,9 @@ impl IniFile {
     /// opened or read (matches the silent-failure behaviour of the C++
     /// constructor).
     pub fn open(path: &[u16]) -> Option<Self> {
-        use winapi::um::fileapi::{CreateFileW, GetFileSize, ReadFile, OPEN_EXISTING};
+        use winapi::um::fileapi::{CreateFileW, GetFileSize, ReadFile, INVALID_FILE_SIZE, OPEN_EXISTING};
         use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
         use winapi::um::winnt::{FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ};
-        use winapi::shared::minwindef::INVALID_FILE_SIZE;
 
         // Ensure NUL-terminated
         let mut path_nul: Vec<u16> = path.to_vec();
