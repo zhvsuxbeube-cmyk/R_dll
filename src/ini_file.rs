@@ -17,6 +17,7 @@
  */
 
 use alloc::vec;
+use alloc::string::ToString;
 
 /// Maximum length for string fields — matches MAX_STRING_LEN in the C++ code.
 pub const MAX_STRING_LEN: usize = 255;

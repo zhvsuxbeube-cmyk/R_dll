@@ -33,7 +33,7 @@ extern crate alloc;
 // The winapi crate pulls in its own core/alloc, so we do not need std.
 use alloc::vec;
 use alloc::vec::Vec;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::format;
 
 use core::ptr;
@@ -42,8 +42,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use winapi::shared::minwindef::{BOOL, DWORD, HMODULE, LPVOID, TRUE};
 use winapi::shared::winerror::S_OK;
 use winapi::um::libloaderapi::{
-    GetModuleFileNameW, GetModuleHandleExW, GetProcAddress, LoadLibraryExW, LoadLibraryW,
-    FindResourceW, LoadResource,
+    GetModuleFileNameW, GetModuleHandleExW, GetProcAddress, LoadLibraryW,
+    FindResourceW, LoadResource, LockResource, SizeofResource,
 };
 use winapi::um::fileapi::{CreateFileW, SetFilePointer, WriteFile, OPEN_ALWAYS};
 use winapi::um::winbase::FILE_END;
@@ -55,13 +55,12 @@ use winapi::um::tlhelp32::{
 };
 use winapi::um::winnt::{
     FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GENERIC_WRITE, HANDLE, THREAD_SUSPEND_RESUME,
+    GENERIC_WRITE, THREAD_SUSPEND_RESUME,
 };
 use winapi::um::processthreadsapi::{ResumeThread, SuspendThread};
 use winapi::um::libloaderapi::GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS;
 
 use winapi::shared::ntdef::{LPCWSTR, PCWSTR, PVOID};
-use winapi::shared::minwindef::WORD;
 
 mod ini_file;
 use ini_file::IniFile;
@@ -107,10 +106,10 @@ impl FarJmp {
     fn as_bytes(&self) -> &[u8] {
         match self {
             FarJmp::X64(j) => unsafe {
-                core::slice::from_raw_parts(j as *const _ as *const u8, core::mem::size_of::<FarJmpX64>())
+                core::slice::from_raw_parts(j as *const FarJmpX64 as *const u8, core::mem::size_of::<FarJmpX64>())
             },
             FarJmp::X86(j) => unsafe {
-                core::slice::from_raw_parts(j as *const _ as *const u8, core::mem::size_of::<FarJmpX86>())
+                core::slice::from_raw_parts(j as *const FarJmpX86 as *const u8, core::mem::size_of::<FarJmpX86>())
             },
         }
     }
@@ -255,11 +254,14 @@ fn write_to_log(text: &str) {
 fn get_current_module() -> HMODULE {
     let mut hmod: HMODULE = ptr::null_mut();
     unsafe {
-        GetModuleHandleExW(
+        let ok = GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-            get_current_module as *const _ as LPCWSTR,
+            get_current_module as *const () as LPCWSTR,
             &mut hmod,
         );
+        if ok == 0 {
+            return ptr::null_mut();
+        }
     }
     hmod
 }
@@ -322,7 +324,7 @@ fn set_threads_state(resume: bool) {
             let hthread = unsafe {
                 OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID)
             };
-            if hthread != INVALID_HANDLE_VALUE {
+            if !hthread.is_null() {
                 unsafe {
                     if resume {
                         ResumeThread(hthread);
@@ -361,12 +363,20 @@ fn get_module_version(module_name: &[u16]) -> Option<FileVersion> {
 /// Shared helper — read the embedded VS_FIXEDFILEINFO out of a module handle.
 unsafe fn read_version_from_module(hmod: HMODULE) -> Option<FileVersion> {
     // RT_VERSION = 0x10, resource id = 1
-    let hri = FindResourceW(hmod, 1 as LPCWSTR, 0x10 as LPCWSTR);
+    let hri = FindResourceW(hmod, 1usize as LPCWSTR, 0x10usize as LPCWSTR);
     if hri.is_null() {
         return None;
     }
     let res = LoadResource(hmod, hri);
     if res.is_null() {
+        return None;
+    }
+    let resource_size = SizeofResource(hmod, hri) as usize;
+    if resource_size < 56 {
+        return None;
+    }
+    let base = LockResource(res) as *const u8;
+    if base.is_null() {
         return None;
     }
     // VS_VERSIONINFO layout (little-endian Windows):
@@ -380,7 +390,6 @@ unsafe fn read_version_from_module(hmod: HMODULE) -> Option<FileVersion> {
     //     dwStrucVersion     +44
     //     dwFileVersionMS    +48
     //     dwFileVersionLS    +52
-    let base = res as *const u8;
     let ms = *(base.add(48) as *const u32);
     let ls = *(base.add(52) as *const u32);
     Some(FileVersion {
@@ -599,7 +608,7 @@ unsafe extern "system" fn new_csl_query_initialize() -> i32 {
                     let full_key = format!("{}.{}", $key, suffix);
                     let offset = ini_read_dword_hex(&sect, &full_key, 0);
                     if offset != 0 {
-                        Some((termsrv_base + offset) as *mut DWORD)
+                        termsrv_base.checked_add(offset).map(|addr| addr as *mut DWORD)
                     } else {
                         None
                     }
@@ -622,7 +631,7 @@ unsafe extern "system" fn new_csl_query_initialize() -> i32 {
                         *ptr = val;
                         let msg = format!(
                             "SLInit [0x{:p}] {} = {}\r\n",
-                            ptr as *const _, $sl_key, val
+                            ptr as *const (), $sl_key, val
                         );
                         write_to_log(&msg);
                     }
@@ -720,9 +729,11 @@ unsafe fn hook() {
     if let Some(ref ini) = globals().ini_file {
         if let Some(var) = ini.get_string("Main", "LogFile") {
             // Convert ASCII value to wide and store
-            let wide: Vec<u16> = var.value.encode_utf16().chain(core::iter::once(0)).collect();
-            let n = wide.len().min(256);
+            let wide: Vec<u16> = var.value.encode_utf16().collect();
+            let n = wide.len().min(255);
+            globals().log_file.fill(0);
             globals().log_file[..n].copy_from_slice(&wide[..n]);
+            globals().log_file[n] = 0;
         }
     }
 
@@ -841,7 +852,7 @@ unsafe fn hook() {
     }
 
     // ---- Resume all threads -----------------------------------------------
-    write_to_log("Resumimg threads...\r\n"); // Note: original had typo "Resumimg"
+    write_to_log("Resuming threads...\r\n"); // Note: original had typo "Resumimg"
     set_threads_state(true);
 }
 
@@ -874,13 +885,17 @@ unsafe fn install_sl_hook() {
     // Save the original bytes
     let mut old_bytes = vec![0u8; stub_size];
     let mut bw: usize = 0;
-    ReadProcessMemory(
+    let read_ok = ReadProcessMemory(
         GetCurrentProcess(),
         fn_ptr as LPVOID,
         old_bytes.as_mut_ptr() as LPVOID,
         stub_size,
         &mut bw,
     );
+    if read_ok == 0 || bw != stub_size {
+        write_to_log("Error: Failed to save original SLGetWindowsInformationDWORD bytes\r\n");
+        return;
+    }
     globals().old_sl_bytes = old_bytes;
     globals().stub_sl = Some(stub);
 
@@ -893,46 +908,6 @@ unsafe fn install_sl_hook() {
 // that mirrors the large if-block inside Hook() after the per-version checks.
 // ---------------------------------------------------------------------------
 unsafe fn apply_binary_patch(sect: &str, arch: &str, ts_base: PlatformDword) {
-    // Helper: read a bool flag from INI
-    macro_rules! read_flag {
-        ($key:expr) => {{
-            let full_key = format!("{}.{}", $key, arch);
-            globals().ini_file.as_ref()
-                .and_then(|i| i.get_bool(sect, &full_key))
-                .unwrap_or(false)
-        }};
-    }
-
-    // Helper: write a patch from PatchCodes section
-    macro_rules! apply_patch {
-        ($offset_key:expr, $code_key:expr, $log_msg:expr) => {{
-            if read_flag!($offset_key.replace("Offset", "Patch")) {
-                write_to_log($log_msg);
-                let off_key = format!("{}.{}", $offset_key, arch);
-                let code_key = format!("{}.{}", $code_key, arch);
-                let offset = ini_read_dword_hex(sect, &off_key, 0);
-                let patch_name = ini_read_string(sect, &code_key, "");
-                if !patch_name.is_empty() {
-                    if let Some(ref ini) = globals().ini_file {
-                        if let Some(ba) = ini.get_bytearray("PatchCodes", &patch_name) {
-                            let sign_ptr = ts_base + offset;
-                            if sign_ptr > ts_base && !ba.value.is_empty() {
-                                let mut bw: usize = 0;
-                                WriteProcessMemory(
-                                    GetCurrentProcess(),
-                                    sign_ptr as LPVOID,
-                                    ba.value.as_ptr() as *const _,
-                                    ba.value.len(),
-                                    &mut bw,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }};
-    }
-
     // ---- LocalOnly patch (CEnforcementCore::GetInstanceOfTSLicense) -------
     {
         let patch_key  = format!("LocalOnlyPatch.{}", arch);
@@ -950,16 +925,17 @@ unsafe fn apply_binary_patch(sect: &str, arch: &str, ts_base: PlatformDword) {
             if !patch_name.is_empty() {
                 if let Some(ref ini) = globals().ini_file {
                     if let Some(ba) = ini.get_bytearray("PatchCodes", &patch_name) {
-                        let sign_ptr = ts_base + offset;
-                        if sign_ptr > ts_base && !ba.value.is_empty() {
-                            let mut bw: usize = 0;
-                            WriteProcessMemory(
-                                GetCurrentProcess(),
-                                sign_ptr as LPVOID,
-                                ba.value.as_ptr() as *const _,
-                                ba.value.len(),
-                                &mut bw,
-                            );
+                        if let Some(sign_ptr) = ts_base.checked_add(offset) {
+                            if sign_ptr > ts_base && !ba.value.is_empty() {
+                                let mut bw: usize = 0;
+                                WriteProcessMemory(
+                                    GetCurrentProcess(),
+                                    sign_ptr as LPVOID,
+                                    ba.value.as_ptr() as *const _,
+                                    ba.value.len(),
+                                    &mut bw,
+                                );
+                            }
                         }
                     }
                 }
@@ -984,16 +960,17 @@ unsafe fn apply_binary_patch(sect: &str, arch: &str, ts_base: PlatformDword) {
             if !patch_name.is_empty() {
                 if let Some(ref ini) = globals().ini_file {
                     if let Some(ba) = ini.get_bytearray("PatchCodes", &patch_name) {
-                        let sign_ptr = ts_base + offset;
-                        if sign_ptr > ts_base && !ba.value.is_empty() {
-                            let mut bw: usize = 0;
-                            WriteProcessMemory(
-                                GetCurrentProcess(),
-                                sign_ptr as LPVOID,
-                                ba.value.as_ptr() as *const _,
-                                ba.value.len(),
-                                &mut bw,
-                            );
+                        if let Some(sign_ptr) = ts_base.checked_add(offset) {
+                            if sign_ptr > ts_base && !ba.value.is_empty() {
+                                let mut bw: usize = 0;
+                                WriteProcessMemory(
+                                    GetCurrentProcess(),
+                                    sign_ptr as LPVOID,
+                                    ba.value.as_ptr() as *const _,
+                                    ba.value.len(),
+                                    &mut bw,
+                                );
+                            }
                         }
                     }
                 }
@@ -1018,16 +995,17 @@ unsafe fn apply_binary_patch(sect: &str, arch: &str, ts_base: PlatformDword) {
             if !patch_name.is_empty() {
                 if let Some(ref ini) = globals().ini_file {
                     if let Some(ba) = ini.get_bytearray("PatchCodes", &patch_name) {
-                        let sign_ptr = ts_base + offset;
-                        if sign_ptr > ts_base && !ba.value.is_empty() {
-                            let mut bw: usize = 0;
-                            WriteProcessMemory(
-                                GetCurrentProcess(),
-                                sign_ptr as LPVOID,
-                                ba.value.as_ptr() as *const _,
-                                ba.value.len(),
-                                &mut bw,
-                            );
+                        if let Some(sign_ptr) = ts_base.checked_add(offset) {
+                            if sign_ptr > ts_base && !ba.value.is_empty() {
+                                let mut bw: usize = 0;
+                                WriteProcessMemory(
+                                    GetCurrentProcess(),
+                                    sign_ptr as LPVOID,
+                                    ba.value.as_ptr() as *const _,
+                                    ba.value.len(),
+                                    &mut bw,
+                                );
+                            }
                         }
                     }
                 }
@@ -1067,9 +1045,10 @@ unsafe fn apply_binary_patch(sect: &str, arch: &str, ts_base: PlatformDword) {
             let _ = func_name; // suppress unused-variable on x64
 
             let jump = make_stub(target_fn);
-            let sign_ptr = ts_base + offset;
-            if sign_ptr > ts_base {
-                write_jump(sign_ptr as *mut u8, &jump);
+            if let Some(sign_ptr) = ts_base.checked_add(offset) {
+                if sign_ptr > ts_base {
+                    write_jump(sign_ptr as *mut u8, &jump);
+                }
             }
         }
     }
@@ -1090,9 +1069,10 @@ unsafe fn apply_binary_patch(sect: &str, arch: &str, ts_base: PlatformDword) {
             let _func_name = ini_read_string(sect, &func_key, "New_CSLQuery_Initialize");
             // Only one function is ever used here
             let jump = make_stub(new_csl_query_initialize as PlatformDword);
-            let sign_ptr = ts_base + offset;
-            if sign_ptr > ts_base {
-                write_jump(sign_ptr as *mut u8, &jump);
+            if let Some(sign_ptr) = ts_base.checked_add(offset) {
+                if sign_ptr > ts_base {
+                    write_jump(sign_ptr as *mut u8, &jump);
+                }
             }
         }
     }
